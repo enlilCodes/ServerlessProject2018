@@ -1,0 +1,283 @@
+  #Serverless CF temaplete to create sns topic, subscribe to it, and publish daily to the topic. Created by John Uhaneh
+  
+AWSTemplateFormatVersion: 2010-09-09
+Description: Serverless subscription stack created by John Uhaneh
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: Configuration
+Resources:
+  
+  # SNS Topic
+  
+  SubscribeSNSTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName:
+        'Fn::Join':
+          - ''
+          - - Ref: 'AWS::StackName'
+            - ' Topic'
+      TopicName:
+        'Fn::Join':
+          - ''
+          - - Ref: 'AWS::StackName'
+            - '-topic'
+            
+  # Lambda will assume this role to provide access to other AWS resources
+
+  IamRoleLambdaExecution:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      
+  # Create a Policy and attach to Lambda Role.
+      
+  IamPolicyLambdaExecution:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: IamPolicyLambdaExecution
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+          Resource: arn:aws:logs:us-west-1:*:*
+        - Effect: Allow
+          Action:
+            - logs:PutLogEvents
+          Resource: arn:aws:logs:us-west-1:*:*
+          Resource: '*'
+        - Effect: Allow
+          Action:
+            - sns:Subscribe
+          Resource: !Ref SubscribeSNSTopic         
+        - Effect: Allow
+          Action:
+            - sns:Publish
+          Resource: !Ref SubscribeSNSTopic
+      Roles:
+      - Ref: IamRoleLambdaExecution
+  
+  # Lambda function to create and subscribe sns topic.
+  
+  SubscribeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Timeout: 5
+      Role:
+        Fn::GetAtt:
+          - IamRoleLambdaExecution
+          - Arn
+      Code:
+        ZipFile: !Sub |
+          var AWS = require("aws-sdk");
+          var sns = new AWS.SNS();          
+          exports.handler = function (event, context, callback) {
+          let responseCode = 200;
+          console.log("request: " + JSON.stringify(event));
+          if (event.queryStringParameters !== null && event.queryStringParameters !== undefined) {
+              if (event.queryStringParameters.email !== undefined && 
+            event.queryStringParameters.email !== null && 
+            event.queryStringParameters.email !== "") {
+            console.log("Received email: " + event.queryStringParameters.email);
+            var email = event.queryStringParameters.email;
+            }
+          }
+          let message ='Your email ' + email + ' has been successfully added to John Uhaneh daily joke list, please confirm your your subscription. Thank you!';
+          subscribe(event, function (event) {   
+            var responseBody = {
+              message: message,
+            };    
+            var response = {
+            statusCode: responseCode,
+             headers: {
+            "x-custom-header" : "my custom header value"
+            },
+            body: JSON.stringify(responseBody)
+            };
+           console.log("response: " + JSON.stringify(response));
+           callback(null, response);
+           });
+    
+           function subscribe (event, done) {
+              var params = {
+                 Protocol: 'email',
+                 TopicArn: "${SubscribeSNSTopic}",
+                 Endpoint:  email,
+                 };
+          sns.subscribe(params, done);
+          }
+          };
+      Runtime: nodejs6.10           
+            
+  # Lambda function to publish daily joke to sns topic.
+
+  SNSPublishFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Timeout: 5
+      Role:
+        Fn::GetAtt:
+          - IamRoleLambdaExecution
+          - Arn
+      Code:
+        S3Bucket: "britecoreproject"
+        S3Key: "SnsPub.zip"
+      Runtime: nodejs6.10
+
+  # Cloudwatch event to trigger lambda periodically
+  
+  ScheduledRule: 
+    Type: "AWS::Events::Rule"
+    Properties: 
+      Description: "ScheduledRule"
+      ScheduleExpression: "rate(1 day)"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt:
+              - "SNSPublishFunction"
+              - "Arn"
+          Id: "TargetFunctionV1"
+  PermissionForEventsToInvokeLambda: 
+    Type: "AWS::Lambda::Permission"
+    Properties: 
+      FunctionName: 
+        Ref: "SNSPublishFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ScheduledRule"
+          - "Arn"
+          
+  # Create the API Gateway
+  
+  ApiGatewaySubscribe:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ApiGatewaySubscribe
+
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId:
+        Fn::GetAtt:
+          - ApiGatewaySubscribe
+          - RootResourceId
+      PathPart: '{proxy+}'
+      RestApiId:
+        Ref: ApiGatewaySubscribe
+
+  ApiGatewayMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      ResourceId:
+        Ref: ApiGatewayResource
+      RestApiId:
+        Ref: ApiGatewaySubscribe
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+              method.response.header.Access-Control-Allow-Methods: "'ANY,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Credentials: "'false'"
+          ResponseTemplates:
+            application/json: "{\"statusCode\": 200}"
+        PassthroughBehavior: "when_no_match"
+        Type: "MOCK"
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+            method.response.header.Access-Control-Allow-Credentials: true
+            
+  ApiGatewayMethodPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: ANY
+      RequestParameters: {}
+      ResourceId:
+        Ref: ApiGatewayResource
+      RestApiId:
+        Ref: ApiGatewaySubscribe
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: "AWS_PROXY"
+        Uri:
+          Fn::Join:
+            - ''
+            - - 'arn:aws:apigateway:'
+              - Ref: AWS::Region
+              - ':lambda:path/2015-03-31/functions/'
+              - Fn::GetAtt:
+                - SubscribeFunction
+                - Arn
+              - '/invocations'
+      MethodResponses: [] 
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId:
+        Ref: ApiGatewaySubscribe
+      StageName: prod
+    DependsOn:
+    - ApiGatewayMethodPost
+    - ApiGatewayMethodOptions
+  
+  # Authorize API Gateway to invoke the Lambda function.
+  
+  SubscribeFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName:
+        Ref: SubscribeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Join:
+          - ''
+          - - 'arn:aws:execute-api:'
+            - Ref: AWS::Region
+            - ':'
+            - Ref: AWS::AccountId
+            - ':'
+            - Ref: ApiGatewaySubscribe
+            - '/*/*'
+
+Outputs:
+  ApiUrl:
+    Description: URL of your API endpoint
+    Value: !Join
+      - ''
+      - - https://
+        - !Ref ApiGatewaySubscribe
+        - '.execute-api.'
+        - !Ref 'AWS::Region'
+        - '.amazonaws.com/prod/subscribe'
